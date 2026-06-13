@@ -1,0 +1,396 @@
+config
+##db.js
+const mongoose = require('mongoose');
+
+const connectDb = async () => {
+  try {
+    const conn = await mongoose.connect(process.env.MONGODB_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+    });
+    console.log(`MongoDB connected: ${conn.connection.host}`);
+  } catch (error) {
+    console.error('MongoDB connection error:', error.message);
+    process.exit(1);
+  }
+};
+
+module.exports = connectDb;
+
+controllers
+##authcontroller.js
+onst express = require('express');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const User = require('../models/User');
+
+const router = express.Router();
+
+const createToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+
+router.post('/register', async (req, res, next) => {
+  try {
+    const { name, email, password, company } = req.body;
+    if (!name || !email || !password) {
+      return res.status(400).json({ message: 'Name, email and password are required' });
+    }
+    const exists = await User.findOne({ email });
+    if (exists) {
+      return res.status(400).json({ message: 'Email already registered' });
+    }
+    const hashed = await bcrypt.hash(password, 10);
+    const user = await User.create({ name, email, password: hashed, company });
+    res.json({ token: createToken(user._id), user: { id: user._id, email, name, plan: user.plan } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/login', async (req, res, next) => {
+  try {
+    const { email, password } = req.body;
+    const user = await User.findOne({ email });
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+    res.json({ token: createToken(user._id), user: { id: user._id, email: user.email, name: user.name, plan: user.plan } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/password-reset', async (req, res, next) => {
+  try {
+    const { email } = req.body;
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(200).json({ message: 'If that email exists, a reset link has been sent.' });
+    }
+    user.resetToken = crypto.randomBytes(20).toString('hex');
+    user.resetTokenExpiry = Date.now() + 3600000;
+    await user.save();
+    res.json({ message: 'Password reset email simulated. Use the reset token from the database in production.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/me', async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ message: 'Authorization required' });
+    }
+    const token = authHeader.split(' ')[1];
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findById(decoded.id).select('-password');
+    res.json(user);
+  } catch (err) {
+    next(err);
+  }
+});
+
+module.exports = router;
+
+## dashboard controller.js
+const express = require('express');
+const { protect } = require('../middleware/auth');
+const Message = require('../models/Message');
+
+const router = express.Router();
+router.use(protect);
+
+router.get('/stats', async (req, res, next) => {
+  try {
+    const total = await Message.countDocuments({ user: req.user._id });
+    const aiReplies = await Message.countDocuments({ user: req.user._id, aiReplyGenerated: true });
+    const sent = await Message.countDocuments({ user: req.user._id, status: 'sent' });
+    const failed = await Message.countDocuments({ user: req.user._id, status: 'failed' });
+    const last7Days = Array.from({ length: 7 }, (_, i) => {
+      const date = new Date();
+      date.setDate(date.getDate() - i);
+      const start = new Date(date.setHours(0, 0, 0, 0));
+      const end = new Date(date.setHours(23, 59, 59, 999));
+      return { date: start.toISOString().slice(0, 10), count: 0 };
+    }).reverse();
+
+    const raw = await Message.aggregate([
+      { $match: { user: req.user._id } },
+      { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } },
+      { $sort: { _id: 1 } },
+    ]);
+
+    const chartData = last7Days.map((day) => {
+      const item = raw.find((row) => row._id === day.date);
+      return { date: day.date, count: item ? item.count : 0 };
+    });
+
+    res.json({ totalMessages: total, aiReplies, sent, failed, chartData });
+  } catch (err) {
+    next(err);
+  }
+});
+
+module.exports = router;
+
+## message controller.js
+const express = require('express');
+const csv = require('json2csv').parse;
+const { protect } = require('../middleware/auth');
+const Message = require('../models/Message');
+const { generateReply } = require('../utils/openai');
+
+const router = express.Router();
+
+const simulateDelivery = () => (Math.random() > 0.16 ? 'sent' : 'failed');
+
+const personalize = (template, recipient) => {
+  return template
+    .replace(/\{\{name\}\}/gi, recipient.name || '')
+    .replace(/\{\{company\}\}/gi, recipient.company || '')
+    .replace(/\{\{email\}\}/gi, recipient.email || '');
+};
+
+router.use(protect);
+
+router.post('/send', async (req, res, next) => {
+  try {
+    console.log('Received send request:', req.body);
+    const { recipients, subject, body, tone, scheduledAt, isBulk } = req.body;
+    console.log('Recipients:', recipients);
+    const planLimits = { free: 20, basic: 100, pro: 500 };
+    const currentPlan = req.user.plan || 'free';
+    const limit = planLimits[currentPlan] || 20;
+    if (req.user.dailyMessageCount + recipients.length > limit) {
+      return res.status(403).json({ message: `Daily message limit reached for ${currentPlan} plan.` });
+    }
+
+    const updatedStatus = recipients.map((recipient) => ({
+      ...recipient,
+      status: simulateDelivery(),
+    }));
+
+    const message = await Message.create({
+      user: req.user._id,
+      recipients: updatedStatus,
+      subject,
+      body,
+      tone,
+      scheduledAt: scheduledAt ? new Date(scheduledAt) : new Date(),
+      status: updatedStatus.every((r) => r.status === 'sent') ? 'sent' : 'failed',
+      isBulk: !!isBulk,
+      sentAt: new Date(),
+    });
+    await req.user.updateOne({ dailyMessageCount: req.user.dailyMessageCount + recipients.length });
+
+    res.json({ message: 'Bulk send queued', result: message });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/ai-reply', async (req, res, next) => {
+  try {
+    const { query, tone, fallback } = req.body;
+    const reply = await generateReply({ apiKey: req.user.apiKey, query, tone: tone || req.user.tone, fallback });
+    res.json({ reply });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/history', async (req, res, next) => {
+  try {
+    const messages = await Message.find({ user: req.user._id }).sort({ createdAt: -1 });
+    res.json(messages);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/retry/:id', async (req, res, next) => {
+  try {
+    const message = await Message.findOne({ _id: req.params.id, user: req.user._id });
+    if (!message) return res.status(404).json({ message: 'Message not found' });
+    message.status = simulateDelivery();
+    message.sentAt = new Date();
+    await message.save();
+    res.json({ message: 'Retry performed', status: message.status });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/export', async (req, res, next) => {
+  try {
+    const messages = await Message.find({ user: req.user._id });
+    const csvData = csv(messages.map((item) => ({
+      id: item._id,
+      subject: item.subject,
+      body: item.body,
+      status: item.status,
+      recipients: item.recipients.map((r) => r.name).join('; '),
+      scheduledAt: item.scheduledAt,
+      sentAt: item.sentAt,
+    })));
+    res.header('Content-Type', 'text/csv');
+    res.attachment('message-history.csv');
+    res.send(csvData);
+  } catch (err) {
+    next(err);
+  }
+});
+
+module.exports = router;
+
+## setting controller.js
+const express = require('express');
+const { protect } = require('../middleware/auth');
+const User = require('../models/User');
+
+const router = express.Router();
+router.use(protect);
+
+router.get('/', async (req, res, next) => {
+  try {
+    const user = await User.findById(req.user._id).select('-password -resetToken -resetTokenExpiry');
+    res.json(user);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.put('/', async (req, res, next) => {
+  try {
+    const { apiKey, tone, autoReplyEnabled, company, name } = req.body;
+    const updates = { apiKey, tone, autoReplyEnabled, company, name };
+    const user = await User.findByIdAndUpdate(req.user._id, updates, { new: true }).select('-password -resetToken -resetTokenExpiry');
+    res.json(user);
+  } catch (err) {
+    next(err);
+  }
+});
+
+module.exports = router;
+
+## subcription controller.js
+const express = require('express');
+const Stripe = require('stripe');
+const { protect } = require('../middleware/auth');
+const User = require('../models/User');
+const SubscriptionPlan = require('../models/SubscriptionPlan');
+
+const router = express.Router();
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY || '');
+
+const plans = [
+  { name: 'free', priceCents: 0, description: 'Free plan with limited messages per day', dailyMessageLimit: 20 },
+  { name: 'basic', priceCents: 999, description: 'Basic plan for small teams', dailyMessageLimit: 100 },
+  { name: 'pro', priceCents: 2499, description: 'Pro plan with advanced automation', dailyMessageLimit: 500 },
+];
+
+router.get('/plans', async (req, res, next) => {
+  try {
+    await Promise.all(plans.map(async (plan) => {
+      await SubscriptionPlan.updateOne({ name: plan.name }, plan, { upsert: true });
+    }));
+    const available = await SubscriptionPlan.find();
+    res.json(available);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/checkout', protect, async (req, res, next) => {
+  try {
+    const { plan } = req.body;
+    const selected = plans.find((item) => item.name === plan);
+    if (!selected) return res.status(400).json({ message: 'Plan not found' });
+
+    if (!process.env.STRIPE_SECRET_KEY) {
+      await User.findByIdAndUpdate(req.user._id, { plan: selected.name });
+      return res.json({ sessionUrl: null, message: 'Stripe not configured. Plan activated for demo.' });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      mode: 'payment',
+      line_items: [{ price_data: { currency: 'usd', product_data: { name: `${selected.name} plan` }, unit_amount: selected.priceCents }, quantity: 1 }],
+      success_url: `${process.env.FRONTEND_URL}/subscription?success=true`,
+      cancel_url: `${process.env.FRONTEND_URL}/subscription?canceled=true`,
+      metadata: { userId: req.user._id.toString(), plan: selected.name },
+    });
+
+    res.json({ sessionUrl: session.url });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/status', protect, async (req, res, next) => {
+  try {
+    const updated = await User.findById(req.user._id).select('plan dailyMessageCount name email');
+    const planData = plans.find((item) => item.name === updated.plan) || plans[0];
+    res.json({ plan: updated.plan, dailyMessageCount: updated.dailyMessageCount, limit: planData.dailyMessageLimit, user: updated });
+  } catch (err) {
+    next(err);
+  }
+});
+
+module.exports = router;
+
+## template controller.js
+const express = require('express');
+const { protect } = require('../middleware/auth');
+const Template = require('../models/Template');
+
+const router = express.Router();
+router.use(protect);
+
+router.get('/', async (req, res, next) => {
+  try {
+    const templates = await Template.find({ user: req.user._id }).sort({ updatedAt: -1 });
+    res.json(templates);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/', async (req, res, next) => {
+  try {
+    const { name, content } = req.body;
+    const template = await Template.create({ user: req.user._id, name, content });
+    res.json(template);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.put('/:id', async (req, res, next) => {
+  try {
+    const template = await Template.findOneAndUpdate(
+      { _id: req.params.id, user: req.user._id },
+      { ...req.body, lastUsed: Date.now() },
+      { new: true }
+    );
+    if (!template) return res.status(404).json({ message: 'Template not found' });
+    res.json(template);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete('/:id', async (req, res, next) => {
+  try {
+    const template = await Template.findOneAndDelete({ _id: req.params.id, user: req.user._id });
+    if (!template) return res.status(404).json({ message: 'Template not found' });
+    res.json({ message: 'Template deleted' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+module.exports = router;
+
+## 
